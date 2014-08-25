@@ -22,15 +22,214 @@ import nipype.pipeline.engine as pe
 import nipype.algorithms.modelgen as model
 import nipype.algorithms.rapidart as ra
 import nipype.interfaces.fsl as fsl
+import nipype.interfaces.ants as ants
 import nipype.interfaces.io as nio
 import nipype.interfaces.utility as niu
 from nipype.workflows.fmri.fsl import (create_featreg_preproc,
                                        create_modelfit_workflow,
-                                       create_fixed_effects_flow,
-                                       create_reg_workflow)
+                                       create_fixed_effects_flow)
+from nipype.interfaces.c3 import C3dAffineTool
 
 fsl.FSLCommand.set_default_output_type('NIFTI_GZ')
 
+def create_reg_workflow(name='registration'):
+    """Create a FEAT preprocessing workflow together with freesurfer
+
+    Parameters
+    ----------
+
+    ::
+
+        name : name of workflow (default: 'registration')
+
+    Inputs::
+
+        inputspec.source_files : files (filename or list of filenames to register)
+        inputspec.mean_image : reference image to use
+        inputspec.anatomical_image : anatomical image to coregister to
+        inputspec.target_image : registration target
+
+    Outputs::
+
+        outputspec.func2anat_transform : FLIRT transform
+        outputspec.anat2target_transform : FLIRT+FNIRT transform
+        outputspec.transformed_files : transformed files in target space
+        outputspec.transformed_mean : mean image in target space
+
+    Example
+    -------
+
+    """
+
+    register = pe.Workflow(name=name)
+
+    inputnode = pe.Node(interface=niu.IdentityInterface(fields=['source_files',
+                                                                 'mean_image',
+                                                                 'anatomical_image',
+                                                                 'target_image',
+                                                                 'target_image_brain',
+                                                                 'config_file']),
+                        name='inputspec')
+    outputnode = pe.Node(interface=niu.IdentityInterface(fields=['func2anat_transform',
+                                                              'anat2target_transform',
+                                                              'transformed_files',
+                                                              'transformed_mean',
+                                                              ]),
+                     name='outputspec')
+
+    """
+    Estimate the tissue classes from the anatomical image. But use spm's segment
+    as FSL appears to be breaking.
+    """
+
+    stripper = pe.Node(fsl.BET(), name='stripper')
+    register.connect(inputnode, 'anatomical_image', stripper, 'in_file')
+    fast = pe.Node(fsl.FAST(), name='fast')
+    register.connect(stripper, 'out_file', fast, 'in_files')
+
+    """
+    Binarize the segmentation
+    """
+
+    binarize = pe.Node(fsl.ImageMaths(op_string='-nan -thr 0.5 -bin'),
+                       name='binarize')
+    pickindex = lambda x, i: x[i]
+    register.connect(fast, ('partial_volume_files', pickindex, 2),
+                     binarize, 'in_file')
+
+    """
+    Calculate rigid transform from mean image to anatomical image
+    """
+
+    mean2anat = pe.Node(fsl.FLIRT(), name='mean2anat')
+    mean2anat.inputs.dof = 6
+    register.connect(inputnode, 'mean_image', mean2anat, 'in_file')
+    register.connect(stripper, 'out_file', mean2anat, 'reference')
+
+    """
+    Now use bbr cost function to improve the transform
+    """
+
+    mean2anatbbr = pe.Node(fsl.FLIRT(), name='mean2anatbbr')
+    mean2anatbbr.inputs.dof = 6
+    mean2anatbbr.inputs.cost = 'bbr'
+    mean2anatbbr.inputs.schedule = os.path.join(os.getenv('FSLDIR'),
+                                                'etc/flirtsch/bbr.sch')
+    register.connect(inputnode, 'mean_image', mean2anatbbr, 'in_file')
+    register.connect(binarize, 'out_file', mean2anatbbr, 'wm_seg')
+    register.connect(inputnode, 'anatomical_image', mean2anatbbr, 'reference')
+    register.connect(mean2anat, 'out_matrix_file',
+                     mean2anatbbr, 'in_matrix_file')
+    """              
+    Convert the BBRegister transformation to ANTS ITK format
+    """
+    
+    convert2itk = pe.MapNode(C3dAffineTool(),
+                          iterfield=['transform_file', 'source_file'],
+                          name='convert2itk')
+    convert2itk.inputs.fsl2ras = True
+    convert2itk.inputs.itk_transform = True
+    register.connect(mean2anatbbr, 'out_matrix_file', convert2itk, 'transform_file')
+    register.connect(inputnode, 'mean_image',convert2itk, 'source_file')
+    register.connect(stripper, 'out_file', convert2itk, 'reference_file')
+
+    """
+    Compute registration between the subject's structural and MNI template
+    This is currently set to perform a very quick registration. However, the
+    registration can be made significantly more accurate for cortical
+    structures by increasing the number of iterations
+    All parameters are set using the example from:
+    #https://github.com/stnava/ANTs/blob/master/Scripts/newAntsExample.sh
+    """
+    
+    reg = pe.Node(ants.Registration(), name='antsRegister')
+    reg.inputs.output_transform_prefix = "output_"
+    reg.inputs.transforms = ['Rigid', 'Affine', 'SyN']
+    reg.inputs.transform_parameters = [(0.1,), (0.1,), (0.2, 3.0, 0.0)]
+    #reg.inputs.number_of_iterations = ([[10000, 111110, 11110]] * 2 + [[100, 50, 30]])
+    reg.inputs.number_of_iterations = [[10000, 11110, 11110]] * 2 + [[100, 30, 20]]
+    reg.inputs.dimension = 3
+    reg.inputs.write_composite_transform = True
+    reg.inputs.collapse_output_transforms = True
+    reg.inputs.initial_moving_transform_com = True
+    reg.inputs.metric = ['Mattes'] * 2 + [['Mattes', 'CC']]
+    reg.inputs.metric_weight = [1] * 2 + [[0.5, 0.5]]
+    reg.inputs.radius_or_number_of_bins = [32] * 2 + [[32, 4]]
+    reg.inputs.sampling_strategy = ['Regular'] * 2 + [[None, None]]
+    reg.inputs.sampling_percentage = [0.3] * 2 + [[None, None]]
+    reg.inputs.convergence_threshold = [1.e-8] * 2 + [-0.01]
+    reg.inputs.convergence_window_size = [20] * 2 + [5]
+    reg.inputs.smoothing_sigmas = [[4, 2, 1]] * 2 + [[1, 0.5, 0]]
+    reg.inputs.sigma_units = ['vox'] * 3
+    reg.inputs.shrink_factors = [[3, 2, 1]]*2 + [[4, 2, 1]]
+    reg.inputs.use_estimate_learning_rate_once = [True] * 3
+    reg.inputs.use_histogram_matching = [False] * 2 + [True]
+    reg.inputs.winsorize_lower_quantile = 0.005
+    reg.inputs.winsorize_upper_quantile = 0.995
+    reg.inputs.args = '--float'
+    reg.inputs.output_warped_image = 'output_warped_image.nii.gz'
+    reg.inputs.num_threads = 4
+    reg.plugin_args = {'qsub_args': '-l nodes=1:ppn=4'}
+    register.connect(stripper, 'out_file', reg, 'moving_image')
+    register.connect(inputnode,'target_image_brain', reg,'fixed_image')
+    
+    
+    """
+    Concatenate the affine and ants transforms into a list
+    """
+    
+    pickfirst = lambda x: x[0]
+ 
+    merge = pe.MapNode(niu.Merge(2), iterfield=['in2'], name='mergexfm')
+    register.connect(convert2itk, 'itk_transform', merge, 'in2')
+    register.connect(reg, ('composite_transform', pickfirst), merge, 'in1')
+
+    
+    """
+    Transform the mean image. First to anatomical and then to target
+    """
+    warpmean = pe.MapNode(ants.ApplyTransforms(),
+                         iterfield=['input_image', 'transforms'],
+                         name='warpmean')
+    warpmean.inputs.input_image_type = 3
+    warpmean.inputs.interpolation = 'BSpline'
+    warpmean.inputs.invert_transform_flags = [False, False]
+    warpmean.inputs.terminal_output = 'file'
+    
+    register.connect(inputnode,'target_image_brain', warpmean,'reference_image')
+    register.connect(inputnode, 'mean_image', warpmean, 'input_image')
+    register.connect(merge, 'out', warpmean, 'transforms')
+
+    """
+    Transform the remaining images. First to anatomical and then to target
+    """
+
+    warpall = pe.MapNode(ants.ApplyTransforms(),
+                         iterfield=['input_image'],
+                         name='warpall')
+    warpall.inputs.input_image_type = 3
+    warpall.inputs.interpolation = 'BSpline'
+    warpall.inputs.invert_transform_flags = [False, False]
+    warpall.inputs.terminal_output = 'file'
+    
+    register.connect(inputnode,'target_image_brain',warpall,'reference_image')
+    register.connect(inputnode,'source_files', warpall, 'input_image')
+    register.connect(merge, 'out', warpall, 'transforms')
+
+
+    """
+    Assign all the output files
+    """
+
+    register.connect(warpmean, 'output_image', outputnode, 'transformed_mean')
+    register.connect(warpall, 'output_image', outputnode, 'transformed_files')
+    register.connect(mean2anatbbr, 'out_matrix_file',
+                     outputnode, 'func2anat_transform')
+    register.connect(reg, 'composite_transform',
+                     outputnode, 'anat2target_transform')
+
+    return register
+    
 
 def get_subjectinfo(subject_id, base_dir, task_id, model_id):
     """Get info for a given subject
@@ -403,7 +602,7 @@ def analyze_openfmri_dataset(data_dir, subject=None, model_id=None,
     wf.connect(registration, 'outputspec.transformed_mean', datasink, 'mean.mni')
     wf.connect(registration, 'outputspec.func2anat_transform', datasink, 'xfm.mean2anat')
     wf.connect(registration, 'outputspec.anat2target_transform', datasink, 'xfm.anat2target')
-
+    
     """
     Set processing parameters
     """
